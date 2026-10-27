@@ -9,6 +9,7 @@ Turn your terminal into a kawaii anime experience! ASCIIme is a command-line too
 ## Features
 
 - Display animated GIFs as ASCII art in your terminal
+- Static images (PNG, JPG, WebP, BMP, TIFF) and animated WebP/APNG
 - High-detail half-block rendering (two pixels per character cell)
 - Optional full-resolution images in Kitty-compatible terminals
 - Optional OpenGL GPU acceleration for image resizing, with CPU fallback
@@ -48,11 +49,32 @@ asciime --cache
 # Play a cached GIF directly by list number or (partial) name
 asciime --cache 3
 asciime --cache nier
+
+# Play any local GIF or image file
+asciime --file ~/Pictures/wallpaper.png
+asciime -f ./sticker.webp -s
 ```
 
 Cached GIFs are stored in `~/.cache/asciime/<category>/<id>.gif`. With
 `--cache` and no value, ASCIIme lists them and prompts you to choose one by
-number or name; press Enter for a random one or `q` to quit.
+number or name; press Enter for a random one or `q` to quit. Names match with
+or without their extension, so use `nier.png` to pick the PNG when a GIF has
+the same name.
+
+### Static images
+
+`--cache` and `--file` accept GIF, PNG, APNG, JPG/JPEG, WebP, BMP and TIFF.
+Animated WebP and APNG files play like GIFs. To add your own images to the
+`--cache` picker, copy them into `~/.cache/asciime/` or a subfolder (the
+subfolder name is used as the category). Files you play from the cache are
+recorded in its database, so cache cleanup (`max_cache_age_days` and
+`max_cache_size_mb`) may delete them later; use `--file` for images you want
+to keep elsewhere.
+
+A static image stays on screen for 3 seconds per loop, so `--repeat 5` shows
+it for 15 seconds, and `--screensaver` keeps it up until Ctrl-C or SIGTERM.
+Photos are rotated according to their EXIF orientation, and 16-bit PNGs are
+scaled down to 8-bit color.
 
 ### Screensaver and repeat count
 
@@ -67,7 +89,7 @@ asciime --random --repeat 5
 ```
 
 Screensaver mode repeats the same selected GIF, not a playlist. Both options
-work with normal mode, `--random`, and `--cache`, and override `loop_count` in
+work with normal mode, `--random`, `--cache` and `--file`, and override `loop_count` in
 the configuration for this run. `--repeat N` requires a positive integer;
 use `--screensaver` for unlimited loops. They cannot be combined. The terminal
 is restored on Ctrl-C or SIGTERM.
@@ -76,7 +98,8 @@ is restored on Ctrl-C or SIGTERM.
 |------|------------|---------|
 | `--help` | `-h` | Show help |
 | `--random` | `-r` | Fetch a random GIF |
-| `--cache [GIF]` | `-c [GIF]` | Choose a cached GIF |
+| `--cache [NAME]` | `-c [NAME]` | Choose a cached GIF or image |
+| `--file PATH` | `-f PATH` | Play a local GIF or image file |
 | `--renderer MODE` | `-R MODE` | Select `blocks`, `kitty`, or `auto` |
 | `--acceleration MODE` | `-a MODE` | Select `auto`, `cpu`, or `gpu` |
 | `--screensaver` | `-s` | Loop indefinitely |

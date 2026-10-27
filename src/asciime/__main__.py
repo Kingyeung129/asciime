@@ -11,7 +11,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from asciime.core.cache_manager import CacheManager
+from asciime.core.cache_manager import CacheManager, SUPPORTED_EXTENSIONS
 from asciime.core.gif_fetcher import GIFFetcher
 from asciime.core.gif_player_fast import GIFPlayer
 from asciime.core.config_manager import ConfigManager
@@ -48,23 +48,30 @@ class FetchError(ASCIImeError):
     pass
 
 class CacheSelectionError(ASCIImeError):
-    """Raised when a GIF cannot be selected from the cache."""
+    """Raised when an image cannot be selected from the cache or a file path."""
     pass
 
 def match_cached_gifs(entries: List[Dict[str, str]], query: str) -> List[Dict[str, str]]:
-    """Match a list number, exact name, or partial name against cached GIFs."""
+    """Match a list number, exact name, or partial name against cached files.
+
+    Names match with or without their extension, so "nier" can select
+    "all/nier.gif" while "nier.png" picks the PNG when both exist.
+    """
     query = query.strip()
     if query.isdigit():
         index = int(query)
         return [entries[index - 1]] if 1 <= index <= len(entries) else []
 
     lowered = query.lower()
-    if lowered.endswith(".gif"):
-        lowered = lowered[:-4]
-    exact = [
-        e for e in entries
-        if lowered in (e["name"].lower(), e["label"].lower())
-    ]
+
+    def names(entry: Dict[str, str]) -> set:
+        label = entry["label"].lower()
+        return {
+            entry["name"].lower(), entry["filename"].lower(),
+            label, label[: -len(Path(label).suffix) or None],
+        }
+
+    exact = [e for e in entries if lowered in names(e)]
     if exact:
         return exact
     return [e for e in entries if lowered in e["label"].lower()]
@@ -75,15 +82,15 @@ def print_cached_gifs(entries: List[Dict[str, str]]) -> None:
         print(f"  {number:>{width}}. {entry['label']}")
 
 def choose_cached_gif(cache_manager: CacheManager, query: Optional[str]) -> Optional[str]:
-    """Pick a cached GIF by query or interactive prompt.
+    """Pick a cached GIF or image by query or interactive prompt.
 
-    Returns the GIF path, or None if the user cancelled the prompt.
+    Returns the file path, or None if the user cancelled the prompt.
     """
     entries = cache_manager.list_cached()
     if not entries:
         raise CacheSelectionError(
-            f"No cached GIFs found in {cache_manager.cache_dir}. "
-            "Run asciime online first to download some."
+            f"No cached GIFs or images found in {cache_manager.cache_dir}. "
+            "Run asciime online first, or copy images into that folder."
         )
 
     if query:
@@ -91,8 +98,8 @@ def choose_cached_gif(cache_manager: CacheManager, query: Optional[str]) -> Opti
         if len(matches) == 1:
             return matches[0]["path"]
         if not matches:
-            raise CacheSelectionError(f"No cached GIF matches '{query}'. Use --cache to list them.")
-        print(f"'{query}' matches several cached GIFs:", file=sys.stderr)
+            raise CacheSelectionError(f"No cached file matches '{query}'. Use --cache to list them.")
+        print(f"'{query}' matches several cached files:", file=sys.stderr)
         print_cached_gifs(matches)
         raise CacheSelectionError("Be more specific, or pick one by number with --cache.")
 
@@ -100,12 +107,12 @@ def choose_cached_gif(cache_manager: CacheManager, query: Optional[str]) -> Opti
         print_cached_gifs(entries)
         raise CacheSelectionError("Pass a number or name, e.g. asciime --cache 1")
 
-    print(f"Cached GIFs ({cache_manager.cache_dir}):")
+    print(f"Cached GIFs and images ({cache_manager.cache_dir}):")
     print_cached_gifs(entries)
     while True:
         try:
             answer = input(
-                f"Choose a GIF [1-{len(entries)} or name, Enter = random, q = quit]: "
+                f"Choose a file [1-{len(entries)} or name, Enter = random, q = quit]: "
             ).strip()
         except (EOFError, KeyboardInterrupt):
             print()
@@ -120,13 +127,22 @@ def choose_cached_gif(cache_manager: CacheManager, query: Optional[str]) -> Opti
         if len(matches) == 1:
             return matches[0]["path"]
         if not matches:
-            print(f"No cached GIF matches '{answer}'.")
+            print(f"No cached file matches '{answer}'.")
         else:
-            print("Several GIFs match:")
+            print("Several files match:")
             print_cached_gifs(matches)
 
-async def play_cached_gif(config: Dict, gif_path: str) -> None:
-    """Play a GIF chosen from the cache without contacting the API."""
+def resolve_image_file(path: str) -> str:
+    """Validate a user-supplied image path and return it as an absolute path."""
+    resolved = Path(path).expanduser()
+    if not resolved.is_file():
+        raise CacheSelectionError(f"Image file not found: {path}")
+    if resolved.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        logger.debug("Unrecognized extension for %s; letting Pillow detect the format", path)
+    return str(resolved.resolve())
+
+async def play_cached_gif(config: Dict, gif_path: str, record_play: bool = True) -> None:
+    """Play a cached or local GIF/image without contacting the API."""
     gif_player = GIFPlayer(
         config["display_mode"],
         terminal_title="ASCIIme",
@@ -134,17 +150,18 @@ async def play_cached_gif(config: Dict, gif_path: str) -> None:
         renderer=config.get("renderer", "blocks"),
         acceleration=config.get("acceleration", "auto"),
     )
-    try:
-        CacheManager().mark_played(gif_path)
-    except Exception as e:
-        logger.debug(f"Could not record playback of {gif_path}: {e}")
+    if record_play:
+        try:
+            CacheManager().mark_played(gif_path)
+        except Exception as e:
+            logger.debug(f"Could not record playback of {gif_path}: {e}")
 
-    logger.debug(f"Playing cached GIF {gif_path}")
+    logger.debug(f"Playing local file {gif_path}")
     try:
         await gif_player.play_animation(gif_path)
     except Exception as e:
-        logger.error(f"Error playing cached GIF: {e}", exc_info=True)
-        raise GIFPlaybackError(f"Failed to play GIF: {str(e)}")
+        logger.error(f"Error playing {gif_path}: {e}", exc_info=True)
+        raise GIFPlaybackError(f"Failed to play {Path(gif_path).name}: {str(e)}")
 
 async def play_random_gif(config: Dict) -> None:
     """Play a single random GIF without caching or prefetching.
@@ -227,6 +244,10 @@ async def async_main(args: argparse.Namespace) -> None:
         
         # Set up logging based on config
         setup_logging(config.get("debug", False))
+
+        if getattr(args, "file_path", None):
+            await play_cached_gif(config, args.file_path, record_play=False)
+            return
 
         if args.cache_path:
             await play_cached_gif(config, args.cache_path)
@@ -324,12 +345,16 @@ def parse_arguments() -> argparse.Namespace:
         nargs="?",
         const="",
         default=None,
-        metavar="GIF",
+        metavar="NAME",
         help=(
-            "Play a GIF from the local cache without using the API. "
-            "Without a value, list cached GIFs and choose one; otherwise "
-            "pass a list number or (partial) name"
+            "Play a GIF or image (PNG, JPG, WebP, ...) from the local cache "
+            "without using the API. Without a value, list cached files and "
+            "choose one; otherwise pass a list number or (partial) name"
         ),
+    )
+    mode.add_argument(
+        "-f", "--file", metavar="PATH",
+        help="Play any local GIF or image file (PNG, JPG, WebP, ...) without using the API",
     )
     parser.add_argument(
         "-R", "--renderer", choices=("blocks", "kitty", "auto"), default=None,
@@ -342,11 +367,14 @@ def parse_arguments() -> argparse.Namespace:
     playback = parser.add_mutually_exclusive_group()
     playback.add_argument(
         "-s", "--screensaver", action="store_true",
-        help="Loop the selected GIF forever, until Ctrl-C or SIGTERM",
+        help="Loop the selected GIF or image forever, until Ctrl-C or SIGTERM",
     )
     playback.add_argument(
         "-n", "--repeat", type=positive_repeat, metavar="N",
-        help="Play the selected GIF N times, overriding the configured loop count",
+        help=(
+            "Play the selected GIF N times (static images stay on screen N times "
+            "as long), overriding the configured loop count"
+        ),
     )
     return parser.parse_args()
 
@@ -357,6 +385,10 @@ def main() -> None:
     try:
         args = parse_arguments()
         args.cache_path = None
+        args.file_path = None
+
+        if args.file is not None:
+            args.file_path = resolve_image_file(args.file)
 
         if args.cache is not None:
             args.cache_path = choose_cached_gif(CacheManager(), args.cache)

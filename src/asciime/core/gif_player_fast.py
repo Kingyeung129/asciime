@@ -11,7 +11,7 @@ import sys
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
-from PIL import Image, ImageSequence
+from PIL import Image, ImageOps, ImageSequence
 
 from asciime.core.image_accelerator import ImageResizer
 
@@ -60,6 +60,17 @@ def _xterm_256(color: Color) -> int:
     if distance((gray_value,) * 3) < distance(cube):
         return gray_index
     return cube_index
+
+
+def _to_rgba(frame: Image.Image) -> Image.Image:
+    """Convert any decoded frame to upright 8-bit RGBA."""
+    frame = ImageOps.exif_transpose(frame)
+    if frame.mode.startswith("I;16") or frame.mode == "I":
+        # Pillow clips 16/32-bit values instead of scaling them to 8 bits.
+        frame = frame.convert("I").point(lambda value: value * (1 / 256)).convert("L")
+    elif frame.mode == "F":
+        frame = frame.point(lambda value: value * 255).convert("L")
+    return frame.convert("RGBA")
 
 
 class _ColorEncoder:
@@ -154,13 +165,16 @@ class GIFPlayer:
 
     @staticmethod
     def _load_frames(gif_path: str) -> List[Tuple[Image.Image, float]]:
+        """Decode a GIF, animated WebP/APNG, or static image into RGBA frames."""
         frames = []
         with Image.open(gif_path) as image:
             for frame in ImageSequence.Iterator(image):
+                # WebP only populates per-frame timing once the frame is loaded.
+                frame.load()
                 duration_ms = frame.info.get("duration") or 0
                 # Browsers treat tiny or missing delays as 100ms; match that.
                 duration = duration_ms / 1000 if duration_ms > 10 else DEFAULT_FRAME_DURATION
-                frames.append((frame.convert("RGBA"), max(MIN_FRAME_DURATION, duration)))
+                frames.append((_to_rgba(frame), max(MIN_FRAME_DURATION, duration)))
         if not frames:
             raise GIFPlayerError(f"No frames found in {gif_path}")
         if len(frames) == 1:
@@ -393,7 +407,7 @@ class GIFPlayer:
             gif_path (str): Path to the GIF file
         """
         if not os.path.isfile(gif_path):
-            raise GIFPlayerError(f"Invalid GIF source: {gif_path}")
+            raise GIFPlayerError(f"Image file not found: {gif_path}")
 
         self._native = self._select_renderer()
         if self._native and self.acceleration == "gpu":
@@ -413,7 +427,7 @@ class GIFPlayer:
         except GIFPlayerError:
             raise
         except Exception as e:
-            raise GIFPlayerError(f"Failed to prepare GIF: {e}") from e
+            raise GIFPlayerError(f"Failed to load image: {e}") from e
 
         self._running = True
         try:

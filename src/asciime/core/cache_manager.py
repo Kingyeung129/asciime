@@ -9,6 +9,16 @@ from pathlib import Path
 from typing import Optional, Dict, List
 import time
 
+# Formats Pillow can decode that are useful to display; animated WebP/PNG play too.
+SUPPORTED_EXTENSIONS = frozenset({
+    ".gif", ".png", ".apng", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff",
+})
+
+
+def is_supported_image(path: Path) -> bool:
+    return path.suffix.lower() in SUPPORTED_EXTENSIONS
+
+
 class CacheManager:
     def __init__(self, cache_dir: str = "~/.cache/asciime"):
         self.cache_dir = os.path.expanduser(cache_dir)
@@ -93,7 +103,9 @@ class CacheManager:
             c.execute("DELETE FROM gifs WHERE last_used < ?", (cutoff_date,))
 
             total_size = 0
-            for path in Path(self.cache_dir).rglob("*.gif"):
+            for path in Path(self.cache_dir).rglob("*"):
+                if not is_supported_image(path):
+                    continue
                 try:
                     total_size += path.stat().st_size
                 except OSError:
@@ -155,24 +167,25 @@ class CacheManager:
         return os.path.join(category_dir, f"{gif_id}.gif")
 
     def list_cached(self) -> List[Dict[str, str]]:
-        """List GIF files in the cache directory, sorted by category and name."""
+        """List cached GIFs and images, sorted by category and file name."""
         root = Path(self.cache_dir)
         entries = []
-        for path in root.rglob("*.gif"):
-            if not path.is_file():
+        for path in root.rglob("*"):
+            if not path.is_file() or not is_supported_image(path):
                 continue
             relative = path.relative_to(root)
             category = relative.parts[0] if len(relative.parts) > 1 else ""
             entries.append({
                 "path": str(path),
                 "name": path.stem,
+                "filename": path.name,
                 "category": category,
-                "label": relative.with_suffix("").as_posix(),
+                "label": relative.as_posix(),
             })
-        return sorted(entries, key=lambda e: (e["category"].lower(), e["name"].lower()))
+        return sorted(entries, key=lambda e: (e["category"].lower(), e["label"].lower()))
 
     def mark_played(self, path: str) -> None:
-        """Record playback so cache cleanup treats the GIF as recently used."""
+        """Record playback so cache cleanup treats the file as recently used."""
         now = datetime.now().isoformat()
         conn = sqlite3.connect(self.db_path)
         try:
@@ -192,7 +205,7 @@ class CacheManager:
                         size, last_used, created, play_count
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (file_path.stem, path, category, "local", 0, 0,
+                    (relative.as_posix(), path, category, "local", 0, 0,
                      file_path.stat().st_size, now, now, 1),
                 )
             conn.commit()
