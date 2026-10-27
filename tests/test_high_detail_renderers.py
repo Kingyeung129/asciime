@@ -1,13 +1,15 @@
 import asyncio
 import concurrent.futures
+import io
 import os
 import re
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from PIL import Image, ImageDraw
+from rich.progress import Progress
 
 from asciime.core import sixel
 from asciime.core.gif_player_fast import (
@@ -152,6 +154,13 @@ class SixelPlayerTests(unittest.TestCase):
         self.assertTrue(all(isinstance(f, str) for f in serial))
         self.assertEqual(_resolve(rendered), list(serial))
 
+    def test_worker_count_is_limited_to_the_number_of_frames(self):
+        player = self._player()
+        with patch(f"{MODULE}.os.cpu_count", return_value=16), \
+                patch(f"{MODULE}.concurrent.futures.ProcessPoolExecutor") as executor:
+            player._sixel_pool(2)
+        self.assertEqual(executor.call_args.args[0], 2)
+
     def test_nocolor_sixel_is_grayscale(self):
         player = self._player(display_mode="nocolor")
         rendered, _ = player._prepare_frames([(_gradient(), 0.1)], TERMINAL)
@@ -160,6 +169,211 @@ class SixelPlayerTests(unittest.TestCase):
 
 
 class SixelPlaybackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_preparation_progress_reports_percentage_and_eta(self):
+        player = GIFPlayer(renderer="sixel", acceleration="cpu")
+        player._mode = "sixel"
+        frames = [(Image.new("RGBA", (2, 2)), 0.02)] * 4
+        now = [0.0]
+        progress = Progress(disable=True, get_time=lambda: now[0])
+        snapshots = []
+        advance = progress.advance
+
+        async def resolve(rendered, index):
+            now[0] += 1
+            return rendered[index], False
+
+        def record(task_id):
+            advance(task_id)
+            task = progress.tasks[0]
+            snapshots.append((task.completed, task.percentage, task.time_remaining))
+
+        with patch.object(player, "_loading_progress", return_value=progress), \
+                patch.object(player, "_prepare_frames", return_value=(["0", "1", "2", "3"], [])), \
+                patch.object(player, "_resolve_frame", side_effect=resolve), \
+                patch.object(progress, "advance", side_effect=record):
+            rendered, uploads = await player._prepare_playback(frames, TERMINAL)
+
+        self.assertEqual(rendered, ["0", "1", "2", "3"])
+        self.assertEqual(uploads, [])
+        self.assertEqual(snapshots, [
+            (1, 25.0, None), (2, 50.0, 2), (3, 75.0, 1), (4, 100.0, 0),
+        ])
+        self.assertFalse(progress.live.is_started)
+
+    async def test_redirected_output_has_no_loading_indicator(self):
+        player = GIFPlayer(renderer="sixel", acceleration="cpu")
+        player._mode = "sixel"
+        frames = [(Image.new("RGBA", (2, 2)), 0.02)]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", stdout), patch("sys.stderr", stderr), \
+                patch.object(player, "_prepare_frames", return_value=(["frame"], [])):
+            await player._prepare_playback(frames, TERMINAL)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+
+    async def test_all_frames_are_buffered_before_terminal_setup(self):
+        player = GIFPlayer(renderer="sixel", acceleration="cpu", loop_count=1)
+        frames = [(Image.new("RGBA", (2, 2)), 0.02)] * 3
+        pending = [concurrent.futures.Future() for _ in frames]
+        events = []
+
+        async def finish_encoding():
+            await asyncio.sleep(0)
+            for index, future in enumerate(pending):
+                future.set_result(str(index))
+                events.append(f"encoded-{index}")
+                await asyncio.sleep(0)
+
+        with patch.object(player, "_select_renderer", return_value="sixel"), \
+                patch.object(player, "_load_frames", return_value=frames), \
+                patch.object(player, "_prepare_frames", return_value=(pending, [])), \
+                patch.object(player, "_setup_terminal", side_effect=lambda: events.append("setup")), \
+                patch.object(player, "_cleanup_terminal"), \
+                patch.object(player, "_play_frames", new_callable=AsyncMock) as play:
+            encoder = asyncio.create_task(finish_encoding())
+            await player.play_animation(__file__)
+            await encoder
+
+        self.assertEqual(events, ["encoded-0", "encoded-1", "encoded-2", "setup"])
+        self.assertEqual(play.call_args.args[1], ["0", "1", "2"])
+
+    async def test_slow_sixel_output_does_not_skip_to_the_next_loop(self):
+        player = GIFPlayer(renderer="sixel", acceleration="cpu", loop_count=2)
+        player._mode = "sixel"
+        player._running = True
+        frames = [(Image.new("RGBA", (2, 2)), 0.02)] * 5
+        now = [0.0]
+        displayed = []
+
+        def write(frame):
+            displayed.append(frame)
+            now[0] += 0.07
+
+        async def sleep(delay):
+            now[0] += delay
+
+        with patch(f"{MODULE}.time.monotonic", side_effect=lambda: now[0]), \
+                patch(f"{MODULE}.shutil.get_terminal_size", return_value=TERMINAL), \
+                patch(f"{MODULE}.asyncio.sleep", side_effect=sleep), \
+                patch.object(player, "_write", side_effect=write):
+            await player._play_frames(frames, ["0", "1", "2", "3", "4"], TERMINAL)
+
+        self.assertEqual(displayed, ["0", "1", "2", "3", "4"] * 2)
+        self.assertAlmostEqual(now[0], 0.9)
+
+    async def test_fast_sixel_output_preserves_frame_durations(self):
+        player = GIFPlayer(renderer="sixel", acceleration="cpu", loop_count=2)
+        player._mode = "sixel"
+        player._running = True
+        image = Image.new("RGBA", (2, 2))
+        frames = [(image, 0.02), (image, 0.1), (image, 0.04)]
+        now = [0.0]
+        displayed = []
+
+        def write(frame):
+            displayed.append((frame, now[0]))
+            now[0] += 0.005
+
+        async def sleep(delay):
+            now[0] += delay
+
+        with patch(f"{MODULE}.time.monotonic", side_effect=lambda: now[0]), \
+                patch(f"{MODULE}.shutil.get_terminal_size", return_value=TERMINAL), \
+                patch(f"{MODULE}.asyncio.sleep", side_effect=sleep), \
+                patch.object(player, "_write", side_effect=write):
+            await player._play_frames(frames, ["0", "1", "2"], TERMINAL)
+
+        self.assertEqual([frame for frame, _ in displayed], ["0", "1", "2"] * 2)
+        for (_, actual), expected in zip(displayed, [0, 0.025, 0.13, 0.175, 0.2, 0.305]):
+            self.assertAlmostEqual(actual, expected)
+        self.assertAlmostEqual(now[0], 0.35)
+
+    async def test_variable_write_latency_never_consumes_sixel_display_time(self):
+        player = GIFPlayer(renderer="sixel", acceleration="cpu", loop_count=2)
+        player._mode = "sixel"
+        player._running = True
+        image = Image.new("RGBA", (2, 2))
+        frames = [(image, 0.03), (image, 0.04), (image, 0.02)]
+        latencies = iter([0.005, 0.08, 0.01, 0.07, 0.002, 0.06])
+        now = [0.0]
+        writes = []
+        delays = []
+
+        def write(frame):
+            now[0] += next(latencies)
+            writes.append((frame, now[0]))
+
+        async def sleep(delay):
+            delays.append(delay)
+            now[0] += delay
+
+        with patch(f"{MODULE}.time.monotonic", side_effect=lambda: now[0]), \
+                patch(f"{MODULE}.shutil.get_terminal_size", return_value=TERMINAL), \
+                patch(f"{MODULE}.asyncio.sleep", side_effect=sleep), \
+                patch.object(player, "_write", side_effect=write):
+            await player._play_frames(frames, ["0", "1", "2"], TERMINAL)
+
+        self.assertEqual([frame for frame, _ in writes], ["0", "1", "2"] * 2)
+        for actual, expected in zip(delays, [0.03, 0.04, 0.02] * 2):
+            self.assertAlmostEqual(actual, expected)
+        self.assertAlmostEqual(now[0], 0.407)
+
+    async def test_resize_buffers_new_frames_before_clearing_or_drawing(self):
+        player = GIFPlayer(renderer="sixel", acceleration="cpu", loop_count=1)
+        player._mode = "sixel"
+        player._running = True
+        frames = [(Image.new("RGBA", (2, 2)), 0.02)] * 2
+        changed = os.terminal_size((100, 30))
+        pending = [concurrent.futures.Future() for _ in frames]
+        futures = tuple(pending)
+        ready_at_write = []
+
+        async def finish_encoding():
+            pending[0].set_result("new-0")
+            await asyncio.sleep(0)
+            pending[1].set_result("new-1")
+
+        with patch(f"{MODULE}.shutil.get_terminal_size", return_value=changed), \
+                patch.object(player, "_prepare_frames", return_value=(pending, [])) as prepare, \
+                patch.object(player, "_write", side_effect=lambda _: ready_at_write.append(
+                    all(f.done() for f in futures)
+                )) as write:
+            encoder = asyncio.create_task(finish_encoding())
+            await player._play_frames(frames, ["old-0", "old-1"], TERMINAL)
+            await encoder
+
+        prepare.assert_called_once_with(frames, changed)
+        self.assertEqual([call.args[0] for call in write.call_args_list],
+                         [ESC + "2J", "new-0", "new-1"])
+        self.assertEqual(ready_at_write, [True, True, True])
+
+    async def test_cancel_during_buffering_leaves_terminal_untouched(self):
+        player = GIFPlayer(renderer="sixel", acceleration="cpu")
+        frames = [(Image.new("RGBA", (2, 2)), 0.02)] * 2
+        pending = concurrent.futures.Future()
+
+        async def run(func, *args):
+            return func(*args)
+
+        with patch.object(player, "_select_renderer", return_value="sixel"), \
+                patch.object(player, "_load_frames", return_value=frames), \
+                patch.object(player, "_prepare_frames", return_value=([pending], [])), \
+                patch.object(player, "_run_in_executor", side_effect=run), \
+                patch.object(player, "_setup_terminal") as setup, \
+                patch.object(player, "_cleanup_terminal") as cleanup, \
+                patch.object(player, "_shutdown_pool") as shutdown:
+            playback = asyncio.create_task(player.play_animation(__file__))
+            await asyncio.sleep(0)
+            playback.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await playback
+
+        self.assertTrue(pending.cancelled())
+        setup.assert_not_called()
+        cleanup.assert_not_called()
+        shutdown.assert_called_once()
+        self.assertFalse(player._running)
+
     async def test_playback_waits_for_pending_frames_and_shuts_down_pool(self):
         player = GIFPlayer(renderer="sixel", acceleration="cpu", loop_count=1)
         with tempfile.TemporaryDirectory() as directory:
@@ -189,6 +403,17 @@ class SixelPlaybackTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SelectionTests(unittest.TestCase):
+    def test_loading_indicator_requires_interactive_stdout_and_stderr(self):
+        player = GIFPlayer()
+        for stdout_tty, stderr_tty in ((True, True), (True, False),
+                                      (False, True), (False, False)):
+            with self.subTest(stdout=stdout_tty, stderr=stderr_tty), \
+                    patch("sys.stdout.isatty", return_value=stdout_tty), \
+                    patch("sys.stderr.isatty", return_value=stderr_tty):
+                progress = player._loading_progress()
+                self.assertEqual(progress.disable, not (stdout_tty and stderr_tty))
+                self.assertTrue(progress.live.transient)
+
     def test_da1_parsing(self):
         self.assertTrue(_da1_reports_sixel(b"\x1b[?61;4;6;7;14;21;22;23;24;28;32;42c"))
         self.assertTrue(_da1_reports_sixel(b"\x1b[?4c"))

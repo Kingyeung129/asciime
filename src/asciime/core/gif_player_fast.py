@@ -15,6 +15,11 @@ import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from PIL import Image, ImageOps, ImageSequence
+from rich.console import Console
+from rich.progress import (
+    BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn,
+    TimeRemainingColumn,
+)
 
 from asciime.core import sixel
 from asciime.core.image_accelerator import ImageResizer
@@ -515,11 +520,14 @@ class GIFPlayer:
         )
         return size, footprint, origin
 
-    def _sixel_pool(self) -> Optional[concurrent.futures.ProcessPoolExecutor]:
-        if self._pool is None and (os.cpu_count() or 1) > 1:
+    def _sixel_pool(
+        self, frame_count: int,
+    ) -> Optional[concurrent.futures.ProcessPoolExecutor]:
+        workers = min(8, frame_count, os.cpu_count() or 1)
+        if self._pool is None and workers > 1:
             try:
                 self._pool = concurrent.futures.ProcessPoolExecutor(
-                    min(8, os.cpu_count() or 1),
+                    workers,
                     # Forking a threaded asyncio process can deadlock; spawn is safe.
                     mp_context=multiprocessing.get_context("spawn"),
                     initializer=sixel.ignore_interrupts,
@@ -542,8 +550,8 @@ class GIFPlayer:
     ) -> List[Union[str, "concurrent.futures.Future[str]"]]:
         """Encode Sixel frames, in worker processes for animations.
 
-        Animated frames are returned as futures so playback can start as soon
-        as the first frame is ready instead of waiting for the whole GIF.
+        Futures let the event loop stay responsive while workers fill the
+        playback buffer.
         """
         still = len(frames) == 1
         grayscale = self.display_mode == "ascii"
@@ -551,7 +559,7 @@ class GIFPlayer:
         for image, _ in frames:
             size, footprint, origin = self._sixel_layout(image.size, terminal)
             jobs.append((image, size, origin, footprint, still, grayscale))
-        pool = None if still else self._sixel_pool()
+        pool = None if still else self._sixel_pool(len(frames))
         if pool is None:
             return [sixel.render(*job) for job in jobs]
         return [pool.submit(sixel.render, *job) for job in jobs]
@@ -633,6 +641,42 @@ class GIFPlayer:
     async def _run_in_executor(self, func: Callable, *args):
         return await asyncio.get_running_loop().run_in_executor(None, func, *args)
 
+    @staticmethod
+    def _loading_progress() -> Progress:
+        return Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TextColumn("ETA"),
+            TimeRemainingColumn(),
+            console=Console(stderr=True),
+            transient=True,
+            disable=not (sys.stdout.isatty() and sys.stderr.isatty()),
+        )
+
+    async def _prepare_playback(
+        self, frames: List[Tuple[Image.Image, float]], terminal: os.terminal_size,
+    ) -> Tuple[List[str], List[str]]:
+        with self._loading_progress() as progress:
+            task = progress.add_task(
+                f"Preparing {self._mode} frames",
+                total=len(frames) if self._mode == "sixel" else None,
+            )
+            rendered, uploads = await self._run_in_executor(
+                self._prepare_frames, frames, terminal
+            )
+            if self._mode == "sixel":
+                buffered = []
+                for index in range(len(rendered)):
+                    output, _ = await self._resolve_frame(rendered, index)
+                    buffered.append(output)
+                    progress.advance(task)
+                rendered = buffered
+            else:
+                progress.update(task, total=len(frames), completed=len(frames))
+        return rendered, uploads
+
     async def _play_frames(
         self, frames: List[Tuple[Image.Image, float]], rendered: List[str],
         terminal: os.terminal_size,
@@ -655,20 +699,16 @@ class GIFPlayer:
                         for stale in rendered:
                             if isinstance(stale, concurrent.futures.Future):
                                 stale.cancel()
-                        rendered, _ = await self._run_in_executor(
-                            self._prepare_frames, frames, terminal
-                        )
+                        rendered, _ = await self._prepare_playback(frames, terminal)
                     self._write(ESC + "2J")
                     deadline = time.monotonic()
 
                 output, waited = await self._resolve_frame(rendered, index)
                 if waited:
-                    # Frames still being encoded play as soon as they are ready.
                     deadline = time.monotonic()
                 deadline += duration
-                # Keep the GIF's timeline when output is slow, rather than
-                # showing overdue frames in a burst or slowing the animation.
-                if time.monotonic() < deadline:
+                # Text and Kitty playback keep the source timeline.
+                if self._mode == "sixel" or time.monotonic() < deadline:
                     if self._mode == "kitty":
                         remove = (
                             self._kitty_command(
@@ -679,7 +719,10 @@ class GIFPlayer:
                         previous = index
                     else:
                         self._write(output)
-                delay = deadline - time.monotonic()
+                # flush() only delivers bytes to the terminal, not the screen.
+                # Keep a full display interval after each Sixel write so a slow
+                # write cannot consume the delay and bunch consecutive frames.
+                delay = duration if self._mode == "sixel" else deadline - time.monotonic()
                 await asyncio.sleep(max(0, delay))
             loops_done += 1
 
@@ -699,16 +742,16 @@ class GIFPlayer:
             logger.debug("Sixel frames are scaled by CPU worker processes")
         try:
             try:
-                frames = await self._run_in_executor(self._load_frames, gif_path)
+                with self._loading_progress() as progress:
+                    progress.add_task("Decoding image", total=None)
+                    frames = await self._run_in_executor(self._load_frames, gif_path)
                 self._image_ids = []
                 if self._mode == "kitty":
                     first_id = secrets.randbelow(1 << 30) + 1
                     self._image_ids = list(range(first_id, first_id + len(frames)))
                 terminal = shutil.get_terminal_size()
                 logger.debug("Preparing %d frames for %s playback", len(frames), self._mode)
-                rendered, uploads = await self._run_in_executor(
-                    self._prepare_frames, frames, terminal
-                )
+                rendered, uploads = await self._prepare_playback(frames, terminal)
             except GIFPlayerError:
                 raise
             except Exception as e:

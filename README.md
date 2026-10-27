@@ -108,8 +108,10 @@ is restored on Ctrl-C or SIGTERM.
 ### Smoother and higher-detail playback
 
 Frames are prepared before playback, so image scaling and character conversion
-do not interrupt the first loop. Playback follows the GIF's frame durations and
-skips overdue frames if terminal output cannot keep up. This does not generate
+do not interrupt the first loop. Playback follows the GIF's frame durations;
+text and Kitty renderers skip overdue frames if terminal output cannot keep up.
+Sixel playback slows to the terminal's output speed instead of skipping through
+the animation and appearing to restart. This does not generate
 extra frames or recover detail missing from the source GIF. Preparation takes
 some time and caches frames in memory.
 
@@ -142,10 +144,22 @@ Kitty images are uploaded once and scaled by the terminal. Sixel frames are
 scaled to the terminal's pixel size (Windows Terminal uses 10x20 pixels per
 cell) and reduced to a 255-color palette per frame; still images additionally
 get Floyd-Steinberg dithering. Animated frames are encoded by parallel worker
-processes while the first loop plays, so it may run slower than later loops.
+processes and fully buffered before playback starts, including after a resize.
+Short animations only start as many workers as they have frames.
+This adds an initial preparation delay but avoids encoding stalls during playback;
+the encoded frames are reused across loops.
+An interactive loading indicator shows the decoding stage, followed by Sixel
+frame-preparation progress and a rough ETA based on completed frames. The estimate
+appears once enough frames are ready and may vary with worker startup and image
+complexity. The indicator clears before playback and is disabled when output is
+redirected.
 Sixel frames of a large terminal are several hundred KB each; if the terminal
-cannot draw that fast, frames are skipped to keep time. A smaller terminal
-window (or larger font) gives smoother Sixel playback.
+cannot draw that fast, playback slows down without dropping frames. Each Sixel
+frame gets its full source delay after its output has been written and flushed;
+slow writes do not consume that display interval or trigger catch-up bursts.
+This can make playback slower than the source GIF, since flushing output does
+not confirm that the terminal has displayed it. A smaller terminal window (or
+larger font) reduces the output workload and can improve Sixel playback.
 
 Sextant glyphs (U+1FB00-1FB3B) must be drawn by the terminal or font. Many
 recent terminals have built-in drawing for them; otherwise use a font that
