@@ -88,7 +88,7 @@ class ConfigManager:
         validated["display_mode"] = display_mode
 
         for key, choices in (
-            ("renderer", ("blocks", "kitty", "auto")),
+            ("renderer", ("blocks", "sextant", "kitty", "sixel", "auto")),
             ("acceleration", ("auto", "cpu", "gpu")),
         ):
             value = config.get(key, DEFAULT_CONFIG[key])

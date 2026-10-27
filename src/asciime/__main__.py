@@ -357,12 +357,14 @@ def parse_arguments() -> argparse.Namespace:
         help="Play any local GIF or image file (PNG, JPG, WebP, ...) without using the API",
     )
     parser.add_argument(
-        "-R", "--renderer", choices=("blocks", "kitty", "auto"), default=None,
-        help="Block art (default), native Kitty graphics, or terminal auto-detection",
+        "-R", "--renderer", choices=("blocks", "sextant", "kitty", "sixel", "auto"),
+        default=None,
+        help="Half-block art (default), finer 2x3 sextant art, native Kitty or Sixel "
+             "graphics, or terminal auto-detection",
     )
     parser.add_argument(
         "-a", "--acceleration", choices=("auto", "cpu", "gpu"), default=None,
-        help="Block resizing backend: auto (default), CPU, or required OpenGL GPU",
+        help="Image resizing backend: auto (default), CPU, or required OpenGL GPU",
     )
     playback = parser.add_mutually_exclusive_group()
     playback.add_argument(

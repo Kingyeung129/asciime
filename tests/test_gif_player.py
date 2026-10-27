@@ -15,20 +15,22 @@ from asciime.core.gif_player_fast import (
 )
 
 TERMINAL = os.terminal_size((100, 30))
+MODULE = "asciime.core.gif_player_fast"
 
 
 class RendererTests(unittest.TestCase):
     def test_default_preserves_block_art(self):
         with patch.dict(os.environ, {"TERM": "xterm-kitty"}, clear=True):
-            self.assertFalse(GIFPlayer()._select_renderer())
+            self.assertEqual(GIFPlayer()._select_renderer(), "blocks")
 
     def test_native_auto_detection_and_cpu_terminal_fallback(self):
-        with patch("sys.stdout.isatty", return_value=True):
-            for term, expected in (("xterm-kitty", True), ("xterm-256color", False)):
+        with patch("sys.stdout.isatty", return_value=True), \
+                patch(f"{MODULE}._terminal_supports_sixel", return_value=False):
+            for term, expected in (("xterm-kitty", "kitty"), ("xterm-256color", "blocks")):
                 with patch.dict(os.environ, {"TERM": term}, clear=True):
                     self.assertEqual(GIFPlayer(renderer="auto")._select_renderer(), expected)
             with patch.dict(os.environ, {"TERM": "xterm-kitty", "TMUX": "session"}, clear=True):
-                self.assertFalse(GIFPlayer(renderer="auto")._select_renderer())
+                self.assertEqual(GIFPlayer(renderer="auto")._select_renderer(), "blocks")
                 with self.assertRaisesRegex(GIFPlayerError, "tmux/screen"):
                     GIFPlayer(renderer="kitty")._select_renderer()
         with patch("sys.stdout.isatty", return_value=False):
@@ -58,7 +60,7 @@ class RendererTests(unittest.TestCase):
 
     def test_native_chunking_retains_original_image_resolution(self):
         player = GIFPlayer(renderer="kitty")
-        player._native = True
+        player._mode = "kitty"
         player._image_ids = [123]
         image = Image.effect_noise((180, 140), 80).convert("RGBA")
         rendered, uploads = player._prepare_frames([(image, 0.02)], TERMINAL)
@@ -76,7 +78,7 @@ class RendererTests(unittest.TestCase):
 
     def test_cleanup_deletes_only_owned_images_and_restores_terminal(self):
         player = GIFPlayer(renderer="kitty")
-        player._native = True
+        player._mode = "kitty"
         player._image_ids = [123, 124]
         with patch.object(player, "_write") as write:
             player._cleanup_terminal()
@@ -160,7 +162,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "sample.gif"
             Image.new("RGB", (8, 8), "red").save(path)
-            with patch.object(player, "_select_renderer", return_value=True):
+            with patch.object(player, "_select_renderer", return_value="kitty"):
                 with patch("asciime.core.gif_player_fast.STILL_IMAGE_DURATION", 0.02):
                     with patch.object(player, "_write") as write:
                         await player.play_animation(str(path))

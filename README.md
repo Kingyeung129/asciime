@@ -100,7 +100,7 @@ is restored on Ctrl-C or SIGTERM.
 | `--random` | `-r` | Fetch a random GIF |
 | `--cache [NAME]` | `-c [NAME]` | Choose a cached GIF or image |
 | `--file PATH` | `-f PATH` | Play a local GIF or image file |
-| `--renderer MODE` | `-R MODE` | Select `blocks`, `kitty`, or `auto` |
+| `--renderer MODE` | `-R MODE` | Select `blocks`, `sextant`, `kitty`, `sixel`, or `auto` |
 | `--acceleration MODE` | `-a MODE` | Select `auto`, `cpu`, or `gpu` |
 | `--screensaver` | `-s` | Loop indefinitely |
 | `--repeat N` | `-n N` | Set the total animation loop count |
@@ -113,24 +113,48 @@ skips overdue frames if terminal output cannot keep up. This does not generate
 extra frames or recover detail missing from the source GIF. Preparation takes
 some time and caches frames in memory.
 
-Block art remains the default. For full image resolution instead of character
-cells, run this in a Kitty-graphics-compatible terminal, such as Kitty or Ghostty:
+Half-block art (`blocks`) remains the default. Renderers, from most to least
+pixelated:
+
+| Renderer | Detail | Requirements |
+|----------|--------|--------------|
+| `blocks` | 1x2 pixels per cell | Any truecolor/256-color terminal |
+| `sextant` | 2x3 pixels per cell | A font or terminal with Unicode 13 sextant glyphs |
+| `sixel` | Real pixels | Sixel terminal: Windows Terminal 1.22+, WezTerm, foot, mlterm, xterm `-ti vt340` |
+| `kitty` | Full source resolution | Kitty graphics protocol: Kitty, Ghostty |
 
 ```bash
+# Pick the best renderer the terminal supports (Kitty, then Sixel, then blocks)
 asciime --cache --renderer auto
-# Explicitly request the Kitty graphics protocol
-asciime --cache nier --renderer kitty
+# Windows Terminal 1.22 or newer
+asciime -f wallpaper.png -R sixel
+# Finer character art that still works over plain text terminals
+asciime -c -R sextant
 ```
 
-`auto` detects Kitty/Ghostty terminal environment variables and otherwise uses
-blocks. Native images are uploaded once and reused across loops; scaling and
-display are handled by the terminal, including its GPU renderer when available.
-The terminal must support the Kitty graphics protocol, not just GPU-accelerated
-text. Native output is currently disabled inside tmux/screen. Use `blocks`
-for ordinary terminals or when you prefer the character-art look.
-`display_mode` controls block art; native images retain their original colors.
+`auto` detects Kitty/Ghostty from environment variables, then asks the terminal
+whether it supports Sixel (a device-attributes query with a short timeout),
+and otherwise uses blocks. Native images are disabled inside tmux/screen in
+`auto` mode; explicit `--renderer sixel` is allowed there for multiplexers that
+pass Sixel through (tmux 3.4+ built with Sixel support).
 
-For optional GPU resizing of block art:
+Kitty images are uploaded once and scaled by the terminal. Sixel frames are
+scaled to the terminal's pixel size (Windows Terminal uses 10x20 pixels per
+cell) and reduced to a 255-color palette per frame; still images additionally
+get Floyd-Steinberg dithering. Animated frames are encoded by parallel worker
+processes while the first loop plays, so it may run slower than later loops.
+Sixel frames of a large terminal are several hundred KB each; if the terminal
+cannot draw that fast, frames are skipped to keep time. A smaller terminal
+window (or larger font) gives smoother Sixel playback.
+
+Sextant glyphs (U+1FB00-1FB3B) must be drawn by the terminal or font. Many
+recent terminals have built-in drawing for them; otherwise use a font that
+includes them, such as Cascadia Code or Iosevka. If you see boxes or question
+marks, use `blocks`. `display_mode` controls text art colors;
+`nocolor` uses ASCII art for `blocks`/`sextant` and grayscale Sixel.
+
+For optional GPU resizing of block and sextant art (Sixel frames are scaled by
+the CPU worker processes):
 
 ```bash
 # From this source checkout
@@ -188,8 +212,8 @@ ASCIIme can be configured by editing `~/.config/asciime/config.json`. Available 
 ```json
 {
     "display_mode": "truecolor",     // Display mode: "truecolor", "256", "256fgbg", or "nocolor"
-    "renderer": "blocks",            // "blocks", "kitty", or "auto"
-    "acceleration": "auto",          // "auto", "cpu", or "gpu" (block resizing)
+    "renderer": "blocks",            // "blocks", "sextant", "kitty", "sixel", or "auto"
+    "acceleration": "auto",          // "auto", "cpu", or "gpu" (image resizing)
     "max_cache_size_mb": 100,        // Maximum cache size in megabytes
     "max_cache_age_days": 30,        // Maximum age of cached files in days
     "prefetch_count": 3,             // Number of GIFs to prefetch
