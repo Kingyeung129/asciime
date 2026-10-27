@@ -9,7 +9,7 @@ __license__ = "MIT"
 from asciime.core.cache_manager import CacheManager
 from asciime.core.config_manager import ConfigManager
 from asciime.core.gif_fetcher import GIFFetcher
-from asciime.core.gif_player import GIFPlayer
+from asciime.core.gif_player_fast import GIFPlayer
 
 __all__ = [
     "CacheManager",

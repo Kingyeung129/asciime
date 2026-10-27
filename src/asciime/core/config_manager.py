@@ -31,6 +31,8 @@ class ConfigDefaults:
 
 DEFAULT_CONFIG = {
     "display_mode": ConfigDefaults.DEFAULT_DISPLAY_MODE,
+    "renderer": "blocks",
+    "acceleration": "auto",
     "max_cache_size_mb": ConfigDefaults.DEFAULT_CACHE_SIZE,
     "max_cache_age_days": ConfigDefaults.DEFAULT_CACHE_AGE,
     "prefetch_count": ConfigDefaults.DEFAULT_PREFETCH,
@@ -84,6 +86,18 @@ class ConfigManager:
             )
             display_mode = ConfigDefaults.DEFAULT_DISPLAY_MODE
         validated["display_mode"] = display_mode
+
+        for key, choices in (
+            ("renderer", ("blocks", "kitty", "auto")),
+            ("acceleration", ("auto", "cpu", "gpu")),
+        ):
+            value = config.get(key, DEFAULT_CONFIG[key])
+            if value not in choices:
+                logger.warning(
+                    "Invalid %s %r, using default: %s", key, value, DEFAULT_CONFIG[key]
+                )
+                value = DEFAULT_CONFIG[key]
+            validated[key] = value
         
         # Cache size
         cache_size = config.get("max_cache_size_mb", ConfigDefaults.DEFAULT_CACHE_SIZE)

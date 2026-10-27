@@ -154,6 +154,51 @@ class CacheManager:
         )
         return os.path.join(category_dir, f"{gif_id}.gif")
 
+    def list_cached(self) -> List[Dict[str, str]]:
+        """List GIF files in the cache directory, sorted by category and name."""
+        root = Path(self.cache_dir)
+        entries = []
+        for path in root.rglob("*.gif"):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root)
+            category = relative.parts[0] if len(relative.parts) > 1 else ""
+            entries.append({
+                "path": str(path),
+                "name": path.stem,
+                "category": category,
+                "label": relative.with_suffix("").as_posix(),
+            })
+        return sorted(entries, key=lambda e: (e["category"].lower(), e["name"].lower()))
+
+    def mark_played(self, path: str) -> None:
+        """Record playback so cache cleanup treats the GIF as recently used."""
+        now = datetime.now().isoformat()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE gifs SET last_used = ?, play_count = play_count + 1 WHERE path = ?",
+                (now, path),
+            )
+            if c.rowcount == 0:
+                file_path = Path(path)
+                relative = file_path.relative_to(self.cache_dir)
+                category = relative.parts[0] if len(relative.parts) > 1 else None
+                c.execute(
+                    """
+                    INSERT OR IGNORE INTO gifs (
+                        id, path, category, source, width, height,
+                        size, last_used, created, play_count
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (file_path.stem, path, category, "local", 0, 0,
+                     file_path.stat().st_size, now, now, 1),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
     async def get_random_cached(
         self,
         category: Optional[str] = None

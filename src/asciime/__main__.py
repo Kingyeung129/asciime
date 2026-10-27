@@ -3,8 +3,9 @@ ASCIIme main module - Handles program initialization and main execution flow.
 """
 import asyncio
 import os
+import random
 import sys
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 import signal
 import argparse
 import logging
@@ -18,13 +19,15 @@ from asciime.core.config_manager import ConfigManager
 def setup_logging(debug: bool = False) -> None:
     """Configure logging with appropriate level and format."""
     level = logging.DEBUG if debug else logging.INFO
+    log_dir = Path.home() / ".cache" / "asciime"
+    log_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[
             logging.StreamHandler(),
             logging.FileHandler(
-                Path.home() / ".cache" / "asciime" / "asciime.log",
+                log_dir / "asciime.log",
                 encoding="utf-8"
             )
         ]
@@ -43,6 +46,105 @@ class GIFPlaybackError(ASCIImeError):
 class FetchError(ASCIImeError):
     """Raised when there's an error fetching a GIF."""
     pass
+
+class CacheSelectionError(ASCIImeError):
+    """Raised when a GIF cannot be selected from the cache."""
+    pass
+
+def match_cached_gifs(entries: List[Dict[str, str]], query: str) -> List[Dict[str, str]]:
+    """Match a list number, exact name, or partial name against cached GIFs."""
+    query = query.strip()
+    if query.isdigit():
+        index = int(query)
+        return [entries[index - 1]] if 1 <= index <= len(entries) else []
+
+    lowered = query.lower()
+    if lowered.endswith(".gif"):
+        lowered = lowered[:-4]
+    exact = [
+        e for e in entries
+        if lowered in (e["name"].lower(), e["label"].lower())
+    ]
+    if exact:
+        return exact
+    return [e for e in entries if lowered in e["label"].lower()]
+
+def print_cached_gifs(entries: List[Dict[str, str]]) -> None:
+    width = len(str(len(entries)))
+    for number, entry in enumerate(entries, 1):
+        print(f"  {number:>{width}}. {entry['label']}")
+
+def choose_cached_gif(cache_manager: CacheManager, query: Optional[str]) -> Optional[str]:
+    """Pick a cached GIF by query or interactive prompt.
+
+    Returns the GIF path, or None if the user cancelled the prompt.
+    """
+    entries = cache_manager.list_cached()
+    if not entries:
+        raise CacheSelectionError(
+            f"No cached GIFs found in {cache_manager.cache_dir}. "
+            "Run asciime online first to download some."
+        )
+
+    if query:
+        matches = match_cached_gifs(entries, query)
+        if len(matches) == 1:
+            return matches[0]["path"]
+        if not matches:
+            raise CacheSelectionError(f"No cached GIF matches '{query}'. Use --cache to list them.")
+        print(f"'{query}' matches several cached GIFs:", file=sys.stderr)
+        print_cached_gifs(matches)
+        raise CacheSelectionError("Be more specific, or pick one by number with --cache.")
+
+    if not sys.stdin.isatty():
+        print_cached_gifs(entries)
+        raise CacheSelectionError("Pass a number or name, e.g. asciime --cache 1")
+
+    print(f"Cached GIFs ({cache_manager.cache_dir}):")
+    print_cached_gifs(entries)
+    while True:
+        try:
+            answer = input(
+                f"Choose a GIF [1-{len(entries)} or name, Enter = random, q = quit]: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+        if answer.lower() in ("q", "quit", "exit"):
+            return None
+        if not answer:
+            return random.choice(entries)["path"]
+
+        matches = match_cached_gifs(entries, answer)
+        if len(matches) == 1:
+            return matches[0]["path"]
+        if not matches:
+            print(f"No cached GIF matches '{answer}'.")
+        else:
+            print("Several GIFs match:")
+            print_cached_gifs(matches)
+
+async def play_cached_gif(config: Dict, gif_path: str) -> None:
+    """Play a GIF chosen from the cache without contacting the API."""
+    gif_player = GIFPlayer(
+        config["display_mode"],
+        terminal_title="ASCIIme",
+        loop_count=config.get("loop_count", 3),
+        renderer=config.get("renderer", "blocks"),
+        acceleration=config.get("acceleration", "auto"),
+    )
+    try:
+        CacheManager().mark_played(gif_path)
+    except Exception as e:
+        logger.debug(f"Could not record playback of {gif_path}: {e}")
+
+    logger.debug(f"Playing cached GIF {gif_path}")
+    try:
+        await gif_player.play_animation(gif_path)
+    except Exception as e:
+        logger.error(f"Error playing cached GIF: {e}", exc_info=True)
+        raise GIFPlaybackError(f"Failed to play GIF: {str(e)}")
 
 async def play_random_gif(config: Dict) -> None:
     """Play a single random GIF without caching or prefetching.
@@ -65,6 +167,8 @@ async def play_random_gif(config: Dict) -> None:
             config["display_mode"],
             terminal_title="ASCIIme",
             loop_count=config.get("loop_count", 3),
+            renderer=config.get("renderer", "blocks"),
+            acceleration=config.get("acceleration", "auto"),
         )
         logger.debug("GIF player initialized")
         
@@ -112,9 +216,21 @@ async def async_main(args: argparse.Namespace) -> None:
     try:
         config_manager = ConfigManager()
         config = config_manager.load_config()
+        for option in ("renderer", "acceleration"):
+            override = getattr(args, option, None)
+            if override is not None:
+                config[option] = override
+        if getattr(args, "screensaver", False):
+            config["loop_count"] = 0
+        elif getattr(args, "repeat", None) is not None:
+            config["loop_count"] = args.repeat
         
         # Set up logging based on config
         setup_logging(config.get("debug", False))
+
+        if args.cache_path:
+            await play_cached_gif(config, args.cache_path)
+            return
 
         if args.random:
             await play_random_gif(config)
@@ -129,6 +245,8 @@ async def async_main(args: argparse.Namespace) -> None:
             config["display_mode"],
             terminal_title="ASCIIme",
             loop_count=config.get("loop_count", 3),
+            renderer=config.get("renderer", "blocks"),
+            acceleration=config.get("acceleration", "auto"),
         )
 
         gif_fetcher = GIFFetcher(config["api_url"], cache_manager)
@@ -176,6 +294,16 @@ async def async_main(args: argparse.Namespace) -> None:
         if gif_fetcher:
             await gif_fetcher.close()
 
+def positive_repeat(value: str) -> int:
+    """Parse a positive total loop count."""
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("repeat count must be a positive integer") from exc
+    if count < 1:
+        raise argparse.ArgumentTypeError("repeat count must be a positive integer")
+    return count
+
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments.
     
@@ -185,56 +313,96 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="ASCIIme - Turn your terminal into a kawaii anime experience!"
     )
-    parser.add_argument(
-        "--random",
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "-r", "--random",
         action="store_true",
         help="Fetch and play a random GIF without prefetching or cleanup",
     )
+    mode.add_argument(
+        "-c", "--cache",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="GIF",
+        help=(
+            "Play a GIF from the local cache without using the API. "
+            "Without a value, list cached GIFs and choose one; otherwise "
+            "pass a list number or (partial) name"
+        ),
+    )
+    parser.add_argument(
+        "-R", "--renderer", choices=("blocks", "kitty", "auto"), default=None,
+        help="Block art (default), native Kitty graphics, or terminal auto-detection",
+    )
+    parser.add_argument(
+        "-a", "--acceleration", choices=("auto", "cpu", "gpu"), default=None,
+        help="Block resizing backend: auto (default), CPU, or required OpenGL GPU",
+    )
+    playback = parser.add_mutually_exclusive_group()
+    playback.add_argument(
+        "-s", "--screensaver", action="store_true",
+        help="Loop the selected GIF forever, until Ctrl-C or SIGTERM",
+    )
+    playback.add_argument(
+        "-n", "--repeat", type=positive_repeat, metavar="N",
+        help="Play the selected GIF N times, overriding the configured loop count",
+    )
     return parser.parse_args()
-
-async def shutdown(loop: asyncio.AbstractEventLoop, signal: signal.Signals) -> None:
-    """Clean shutdown of the event loop.
-    
-    Args:
-        loop: Event loop to shut down
-        signal: Signal that triggered the shutdown
-    """
-    logger.info(f"Received exit signal {signal.name}")
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    
-    for task in tasks:
-        task.cancel()
-    
-    logger.info(f"Cancelling {len(tasks)} outstanding tasks")
-    await asyncio.gather(*tasks, return_exceptions=True)
-    loop.stop()
 
 def main() -> None:
     """Entry point for the ASCIIme application."""
+    loop = None
+    original_handlers = {}
     try:
         args = parse_arguments()
+        args.cache_path = None
+
+        if args.cache is not None:
+            args.cache_path = choose_cached_gif(CacheManager(), args.cache)
+            if args.cache_path is None:
+                return
 
         if sys.platform == "win32":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        main_task = loop.create_task(async_main(args))
         
         signals = (signal.SIGTERM, signal.SIGINT)
         for s in signals:
-            loop.add_signal_handler(
-                s, lambda s=s: asyncio.create_task(shutdown(loop, s))
+            original_handlers[s] = signal.signal(
+                s, lambda signum, frame: loop.call_soon_threadsafe(main_task.cancel)
             )
 
 
-        loop.run_until_complete(async_main(args))
+        loop.run_until_complete(main_task)
 
+    except asyncio.CancelledError:
+        logger.info("Playback stopped")
     except KeyboardInterrupt:
         logger.info("Operation cancelled by user")
+    except CacheSelectionError as e:
+        print(f"asciime: {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
     finally:
-        loop.close()
+        if loop is not None:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            if hasattr(loop, "shutdown_default_executor"):
+                loop.run_until_complete(loop.shutdown_default_executor())
+            for signum, handler in original_handlers.items():
+                signal.signal(signum, handler)
+            loop.close()
+            asyncio.set_event_loop(None)
 
 if __name__ == "__main__":
     main()
